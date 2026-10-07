@@ -23,5 +23,8 @@
   "max_media_bytes": 16777216,
   "max_http_workers": 8,
   "api_routes": [],
-  "log_level": "INFO"
+  "log_level": "INFO",
+  "proactive_enabled": true,
+  "interaction_auto_ack": true,
+  "stream_protocol": "stream_messages"
 }

@@ -40,15 +40,18 @@ def main():
             if arg is not None:
                 data[key] = json.loads(arg)
         cfg = load_config(args.config)
-        plan = normalize_reply(data, cfg["max_media_bytes"])
+        store = EventStore(
+            cfg["db_path"],
+            cfg["context_window"],
+            cfg["retention_days"],
+            cfg["reply_windows"],
+        )
+        wake = store.get_wake(args.wake_id)
+        plan = normalize_reply(
+            data, cfg["max_media_bytes"], wake["scope"] if wake else "group"
+        )
     except (ValueError, OSError) as exc:
         parser.error(str(exc))
-    store = EventStore(
-        cfg["db_path"],
-        cfg["context_window"],
-        cfg["retention_days"],
-        cfg["reply_windows"],
-    )
 
     async def execute():
         token = await TokenManager(cfg["appid"], cfg["appsecret"]).get_token()

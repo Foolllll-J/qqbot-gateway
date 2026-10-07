@@ -2,7 +2,7 @@
 
 QQ 官方机器人服务端：接收 Gateway 事件、保存原始数据、维护被动回复队列，向客户端提供带 Bearer 认证的 HTTP 接口。客户端决定回复策略、话术、人设和媒体内容。
 
-这是实现了群聊和 C2C 私聊的独立服务，不依赖 AstrBot 或 `gateway_client.py`。当前自动化测试使用模拟 QQ 接口和临时 SQLite；真实机器人权限、媒体格式限制与沙箱域名尚需上线验证。
+这是实现了群聊、C2C 私聊、文字子频道和频道私信的独立服务，不依赖 AstrBot 或 `gateway_client.py`。0.2.0 补齐显式主动发送和 C2C 流式会话。当前自动化测试使用模拟 QQ 接口和临时 SQLite；真实机器人权限、媒体格式限制与沙箱域名尚需上线验证。
 
 ## 服务边界
 
@@ -10,8 +10,8 @@ QQ 官方机器人服务端：接收 Gateway 事件、保存原始数据、维�
 
 1. Gateway WS 连接、心跳、会话恢复，以及 AppID/AppSecret 直接获取 token。
 2. 保存收到的原始 dispatch 事件，包括富媒体字段和未知字段。
-3. 将官方群 @ 事件、显式配置识别的全量群 @、C2C 消息放入队列。绝不自动学习 mention ID。
-4. 可配置的即时 ack 和 HTTP 收发接口。
+3. 将官方 @ 事件、显式配置识别的全量消息 @、C2C 和频道私信消息放入队列。绝不自动学习 mention ID。
+4. 可配置的即时 ack 和 HTTP 收发接口，包括显式主动发送、交互确认和流式协议状态。
 
 稳定目标是协议层尽量不动。QQ 官方 API 变更，或需要增加关键词等新的服务端触发类型时，才调整服务端。回复策略、话术、人设和新群身份映射由客户端或配置处理。新群还必须已加入机器人并具备相应平台权限；仅改配置无法获得权限。新媒体原始字段通过 `raw_event` 直接透传；已有 QQ 消息接口的新 body 字段通过 `qq_payload` 透传。需要不同端点、上传协议或新的状态机时，仍可能需要协议适配，不能保证任意未来功能无需改代码。
 
@@ -19,15 +19,22 @@ QQ 官方机器人服务端：接收 Gateway 事件、保存原始数据、维�
 
 | 能力 | 行为 |
 | --- | --- |
-| 群聊 / C2C | 保存消息、隔离上下文、被动回复 |
-| 图片 / 视频 / 语音 / 文件 | URL 或标准 base64；上传得到 file_info，再发送消息 |
+| 群聊 / C2C / 频道 / 频道私信 | 保存消息、按四种 scope 隔离上下文、被动回复 |
+| 主动发送 | `/messages/send`，无需 wake_id 或入站 msg_id；文本、媒体、原生 body、多条消息；持久幂等和结果查询 |
+| 群聊/C2C 图片 / 视频 / 语音 / 文件 | URL 或标准 base64；上传得到 file_info，再发送消息 |
+| 频道/频道私信图片 | URL image 或 base64 multipart file_image，使用频道 API，不套用 v2 files/msg_type |
 | 大文件 | base64 解码后大于 5 MiB 使用分片上传；默认本地上限 16 MiB，QQ 自身限制仍适用 |
 | Markdown / 键盘 / ARK 等 | 通过原生 `qq_payload` 提交；具体组合依赖 QQ 接口、账号权限和模板 |
 | 多条回复 | 有序发送，事先检查剩余额度；记录每条结果，不自动补发失败或未知部分 |
-| 其他事件 | `/events` 按游标读取完整 dispatch 帧；只记录，不自动产生业务动作 |
+| C2C 流式回复 | start/update/complete/cancel；新 stream_messages 全文替换与 AstrBot legacy stream 增量协议，显式选择，不在未知发送后切协议重发 |
+| 按钮交互 | 原生 keyboard 发送、原始 INTERACTION_CREATE 透传、默认即时接收 ACK；客户端保留业务动作 |
+| 输入中提示 / 召回 / 创建频道私信 | `/typing`、`/messages/recall`、`/dms/create`；QQ 权限和范围限制仍适用 |
+| 其他事件 | `/events` 按游标读取完整 dispatch 帧，业务解释由客户端负责 |
 | 其他 QQ HTTP API | `/api/request`，默认关闭，需配置精确 method/path 白名单 |
 
-频道、主动推送、流式消息状态机尚未实现；`/capabilities` 会明确返回 false。交互按钮事件会进入 `/events`，但交互确认等动作需要专门配置 API 白名单和客户端处理，不能仅靠消息中的键盘完成全流程。原生 body 保留未知字段，同时禁止客户端覆盖 `msg_id`、`msg_seq`、`event_id`、`is_wakeup` 和 stream 字段，避免绕过回复状态机。
+`/capabilities` 的 schema_version 为 2，旧 wakes/reply 接口继续兼容。这里的 implemented 表示网关代码实现能力，不表示账号已经获批。原生 body 保留未知字段，同时禁止客户端覆盖 msg_id、msg_seq、event_id、is_wakeup 和 stream 字段；主动、事件回复、召回通过显式入口管理这些关联字段。
+
+主动推送可用性存在资料冲突：腾讯旧 [发送消息文档](https://github.com/tencent-connect/bot-docs/blob/main/docs/develop/api-v2/server-inter/message/send-receive/send.md) 写有停止主动推送的公告，而新 SDK 和本地 AstrBot 提供无 msg_id 的发送路径。服务端实现这条路径，原样返回 QQ 拒绝、额度和权限错误，不承诺绕过平台限制，也不把被动失败自动转成主动发送。能力对照与实测边界见 [docs/ASTRBOT_PARITY.md](docs/ASTRBOT_PARITY.md)。
 
 实现参考腾讯官方 [Node SDK](https://github.com/tencent-connect/qqbot-nodejs)、[Agent SDK](https://github.com/tencent-connect/qqbot-agent-sdk)、[BotGo](https://github.com/tencent-connect/botgo) 和本地 AstrBot 的 QQ official 适配。参考实现及文档不代表真实账号已经获得对应能力。
 
@@ -36,9 +43,12 @@ QQ 官方机器人服务端：接收 Gateway 事件、保存原始数据、维�
 复制 `config.example.json` 为 `config.json`，填写 appid、appsecret 和随机 api_bearer（至少 32 个无空白 ASCII 字符），例如 `openssl rand -hex 32`。示例占位值会被启动校验拒绝。配置与数据库均不要提交 Git。
 
 - `env`: 默认 formal，使用 `https://api.bot.qq.com`。sandbox 沿用历史域名，必须实际验证。
-- `intents`: 默认 `33554432`（群聊/C2C）；全量群消息需账号支持和对应官方 intent，服务端不自行猜测权限。
-- `bot_mention_ids`: `{"真实group_openid": ["该群事件里机器人的真实身份ID"]}`。各群分别配置，不能假设身份跨群相同。官方 `GROUP_AT_MESSAGE_CREATE` 自身已经表明 @ 机器人，无需该映射；全量 `GROUP_MESSAGE_CREATE` 使用映射匹配 content 中 `<@ID>` 或 mentions 中 id/member_openid。
+- `intents`: 默认 `33554432`（群聊/C2C）；频道 @ 为 `1 << 30`、频道私信为 `1 << 12`、按钮回调为 `1 << 26`。全部这些位与默认位合并是 `1174409216`，仅在账号权限允许时配置。全量群/频道消息需要另外的官方权限和 intent，不擅自替你打开。
+- `bot_mention_ids`: `{"真实group_openid": ["该群事件里机器人的真实身份ID"]}`。各群分别配置，不能假设身份跨群相同。官方 GROUP_AT_MESSAGE_CREATE 和 AT_MESSAGE_CREATE 自身已经表明 @ 机器人，无需该映射；全量消息用映射匹配 content 的 @ 或 mentions。频道全量消息的映射键使用 channel_id，同样不自动学习。
 - `ack_enabled`: 默认 true；`c2c_ack_enabled`: 默认 false。ack 文本由 `ack_text` 配置，ack 失败/超时不自动重发。
+- `proactive_enabled`: 默认 true，允许认证客户端明确请求主动发送；不代表 QQ 账号权限。设为 false 可禁用主动与 wakeup 模式。
+- `interaction_auto_ack`: 默认 true，收到按钮事件后即时回复 code=0 的接收 ACK，不执行客户端业务。若要客户端自行决定 ACK code，设为 false，且客户端必须采用能满足 QQ 约 5 秒时限的事件处理方式；一分钟轮询无法及时确认按钮。
+- `stream_protocol`: 默认 stream_messages（新 SDK 的全文 replace）；可改 legacy（本地 AstrBot 的 stream 增量），或每次 start 显式指定。两种协议绝不自动试发回退。
 - `reply_windows`: 群默认 300 秒且不允许超过 300；C2C 保守默认 300 秒，可配置到 3600，但必须先验证平台实际接受范围。
 - `context_window`: 每个会话保留消息条数，默认 500；`context_limit`: 每个 wake 带出的上下文，默认 30，截止到唤醒消息，避免混入之后的消息。
 - `wake_batch_size`: 默认 20；`retention_days`: 默认 7，清理终态任务和原始事件；原始事件另有 100000 条上限。
@@ -59,7 +69,17 @@ GET  /capabilities
 GET  /wakes
 GET  /wakes/{wake_id}
 GET  /events?after=0&limit=100
+GET  /targets?after=0&limit=100
+GET  /operations/{request_id}
+GET  /streams/{stream_id}
 POST /wakes/reply
+POST /messages/send
+POST /streams/start|update|complete|cancel
+POST /interactions/ack
+POST /typing
+POST /dms/create
+POST /messages/recall
+POST /media/upload-target
 POST /media/upload
 POST /api/request
 ```
@@ -124,5 +144,7 @@ sudo journalctl -u qqbot-gateway -f
 ```
 
 测试覆盖旧 schema 升级、并发领取、序号上限、超时不重发、WS 恢复、原始富媒体、C2C 隔离、URL/base64/分片上传、多条部分失败和原生字段。上线还需实际测：群 @ / 私聊收发、媒体 URL 可达与平台格式限制、账号模板/键盘权限、断线恢复与重启。测试通过不等于实际 QQ 接口验收。
+
+0.2 另有主动发送并发幂等、未知结果恢复、四 scope 路由、频道图片 multipart、两种流式协议、交互 ACK、typing、撤回和私信创建测试。给客户端 agent 的升级说明见 [docs/CLIENT_HANDOFF.md](docs/CLIENT_HANDOFF.md)。旧配置仍可使用；新增键有默认值，无需覆盖原有 config.json，但频道/按钮事件需要按权限显式修改 intents。
 
 向现有服务发测试消息后，记录事件类型、group_openid、author 的 member_openid/user_openid、content 内 @ 字符串、mentions 内机器人的 ID。不同群分别采集，不用提供 AppSecret/Bearer/token。判断机器人身份应与已知的测试 @ 对照，不能把所有被 @ 的人加入配置。

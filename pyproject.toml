@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qqbot-gateway"
-version = "0.1.0"
-description = "QQ official bot gateway, durable wake queue and passive reply transport"
+version = "0.2.0"
+description = "QQ official bot gateway with durable replies, proactive actions and streaming"
 requires-python = ">=3.10"
 dependencies = ["aiohttp>=3.10,<4", "requests>=2.32,<3"]
 
@@ -14,4 +14,4 @@ qqbot-gateway = "qq_gateway_server:main"
 qqbot-reply = "reply:main"
 
 [tool.setuptools]
-py-modules = ["qq_gateway_server", "qq_runtime", "qq_media", "reply"]
+py-modules = ["qq_gateway_server", "qq_runtime", "qq_media", "qq_actions", "reply"]

@@ -5,7 +5,14 @@ import hashlib
 import json
 import sqlite3
 import time
-from qq_media import api_path, normalize_reply, request_json, upload_media, UploadError
+from qq_media import (
+    api_path,
+    normalize_reply,
+    request_json,
+    upload_media,
+    UploadError,
+    send_guild_message,
+)
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -65,11 +72,21 @@ def load_config(path):
         raise ValueError(
             "bot_mention_ids 必须为 group_openid 到机器人身份字符串列表的映射"
         )
-    for key in ("ack_enabled", "c2c_ack_enabled"):
+    for key in (
+        "ack_enabled",
+        "c2c_ack_enabled",
+        "interaction_auto_ack",
+        "proactive_enabled",
+    ):
         if key in cfg and type(cfg[key]) is not bool:
             raise ValueError(f"{key} must be boolean")
     cfg.setdefault("ack_enabled", True)
     cfg.setdefault("c2c_ack_enabled", False)
+    cfg.setdefault("interaction_auto_ack", True)
+    cfg.setdefault("proactive_enabled", True)
+    cfg.setdefault("stream_protocol", "stream_messages")
+    if cfg["stream_protocol"] not in ("stream_messages", "legacy"):
+        raise ValueError("stream_protocol must be stream_messages or legacy")
     cfg.setdefault("ack_text", "Received; your reply is being prepared.")
     if not isinstance(cfg["ack_text"], str) or not cfg["ack_text"].strip():
         raise ValueError("ack_text must be nonempty")
@@ -221,6 +238,9 @@ class EventStore:
             CREATE TABLE IF NOT EXISTS send_parts(wake_id INTEGER NOT NULL,part_index INTEGER NOT NULL,
                 msg_seq INTEGER,status TEXT NOT NULL,result TEXT,PRIMARY KEY(wake_id,part_index));
             CREATE TABLE IF NOT EXISTS gateway_state(id INTEGER PRIMARY KEY CHECK(id=1),session_id TEXT,seq INTEGER);
+            CREATE TABLE IF NOT EXISTS targets(scope TEXT NOT NULL,target_id TEXT NOT NULL,
+                guild_id TEXT,channel_id TEXT,user_id TEXT,last_message_id TEXT,last_seen TEXT,
+                PRIMARY KEY(scope,target_id));
             """)
             for table in ("messages", "pending_wakes"):
                 fields = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
@@ -261,6 +281,9 @@ class EventStore:
                     "UPDATE pending_wakes SET deadline=? WHERE id=?",
                     (event_deadline(row["timestamp"]), row["id"]),
                 )
+            conn.execute(
+                "INSERT OR IGNORE INTO targets(scope,target_id,user_id,last_message_id,last_seen) SELECT scope,target_id,member_openid,msg_id,timestamp FROM messages WHERE id IN (SELECT MAX(id) FROM messages GROUP BY scope,target_id) AND target_id IS NOT NULL AND target_id!=''"
+            )
             conn.commit()
 
     @contextmanager
@@ -276,24 +299,37 @@ class EventStore:
             conn.close()
 
     def save_event(self, d, is_at, event_name="GROUP_MESSAGE_CREATE", frame=None):
-        scope = "c2c" if event_name == "C2C_MESSAGE_CREATE" else "group"
+        scope = {
+            "C2C_MESSAGE_CREATE": "c2c",
+            "DIRECT_MESSAGE_CREATE": "dm",
+            "AT_MESSAGE_CREATE": "channel",
+            "MESSAGE_CREATE": "channel",
+        }.get(event_name, "group")
         msg_id = d.get("id")
         group = d.get("group_openid", "")
-        target = (d.get("author") or {}).get("user_openid") if scope == "c2c" else group
+        author = d.get("author") or {}
+        target = {
+            "c2c": author.get("user_openid"),
+            "channel": d.get("channel_id"),
+            "dm": d.get("guild_id"),
+            "group": group,
+        }[scope]
         if (
             not isinstance(msg_id, str)
             or not msg_id
             or not isinstance(target, str)
             or not target
         ):
-            raise ValueError("群消息缺少 id/group_openid")
+            raise ValueError("Message lacks id or scope-specific target")
         author = d.get("author") or {}
         values = (
             msg_id,
             group,
             author.get("user_openid")
             if scope == "c2c"
-            else author.get("member_openid"),
+            else author.get("member_openid")
+            if scope == "group"
+            else author.get("id"),
             author.get("username") or author.get("nick"),
             d.get("content") or "",
             int(is_at),
@@ -319,6 +355,20 @@ class EventStore:
                 ensure_ascii=False,
             )
             self._record_event(conn, frame or {"t": event_name, "d": d})
+            conn.execute(
+                "INSERT INTO targets VALUES(?,?,?,?,?,?,?) ON CONFLICT(scope,target_id) DO UPDATE SET guild_id=excluded.guild_id,channel_id=excluded.channel_id,user_id=excluded.user_id,last_message_id=excluded.last_message_id,last_seen=excluded.last_seen",
+                (
+                    scope,
+                    target,
+                    d.get("guild_id"),
+                    d.get("channel_id"),
+                    author.get("user_openid")
+                    or author.get("member_openid")
+                    or author.get("id"),
+                    msg_id,
+                    d.get("timestamp"),
+                ),
+            )
             cur = conn.execute(
                 "INSERT OR IGNORE INTO messages(msg_id,group_openid,member_openid,author_name,content,is_at,timestamp) VALUES(?,?,?,?,?,?,?)",
                 values,
@@ -340,7 +390,7 @@ class EventStore:
                     values[:5]
                     + (
                         values[6],
-                        event_deadline(values[6], self.reply_windows[scope]),
+                        event_deadline(values[6], self.reply_windows.get(scope, 300)),
                         message["id"],
                     ),
                 )
@@ -607,11 +657,26 @@ class EventStore:
                 )
             ]
 
+    def get_targets(self, after=0, limit=100):
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT rowid AS cursor,* FROM targets WHERE rowid>? ORDER BY rowid LIMIT ?",
+                (after, limit),
+            ).fetchall()
+            return {
+                "targets": [dict(r) for r in rows],
+                "next_cursor": rows[-1]["cursor"] if rows else after,
+            }
+
 
 def reply_to_wake(
     store, api_base, token, wake_id, text="", plan=None, max_bytes=16 * 1024 * 1024
 ):
-    plan = plan if plan is not None else normalize_reply({"text": text}, max_bytes)
+    if plan is None:
+        wake = store.get_wake(wake_id)
+        plan = normalize_reply(
+            {"text": text}, max_bytes, wake["scope"] if wake else "group"
+        )
     canonical = json.dumps(
         plan, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     )
@@ -624,7 +689,7 @@ def reply_to_wake(
         try:
             store.touch_claim(wake_id)
             payload = dict(item["payload"])
-            if "source" in item:
+            if "source" in item and wake["scope"] in ("group", "c2c"):
                 upload = upload_media(
                     api_base,
                     token,
@@ -634,13 +699,24 @@ def reply_to_wake(
                     max_bytes,
                 )
                 payload["media"] = {"file_info": upload["file_info"]}
+                payload["content"] = payload.get("content") or " "
             if wake["deadline"] <= time.time() + 5:
                 status = "partial" if results else "expired"
                 store.finish_reply(wake_id, status, error="passive_window_expired")
                 return {"ok": False, "status": status, "parts": results}
             payload.update(msg_id=wake["msg_id"], msg_seq=seq)
             store.record_part(wake_id, index, seq, "sending")
-            if (
+            if wake["scope"] in ("channel", "dm"):
+                result = send_guild_message(
+                    api_base,
+                    token,
+                    wake["scope"],
+                    wake["target_id"],
+                    payload,
+                    item.get("source"),
+                    max_bytes,
+                )
+            elif (
                 wake["scope"] == "group"
                 and set(payload) == {"msg_type", "content", "msg_id", "msg_seq"}
                 and payload["msg_type"] == 0

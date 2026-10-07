@@ -4,6 +4,7 @@
 import argparse
 import asyncio
 import hmac
+import hashlib
 import json
 import logging
 import re
@@ -16,6 +17,7 @@ from urllib.parse import urlsplit, parse_qs
 
 import aiohttp
 from qq_media import normalize_reply, upload_media, request_json, UploadError
+from qq_actions import Actions, PATHS as ACTION_PATHS, identifier
 from qq_runtime import (
     exclusive_instance,
     API_BASE,
@@ -53,14 +55,17 @@ class GatewayClient:
         self.message_locks = {}
         self.http_jobs = set()
         self.http_jobs_lock = threading.Lock()
+        self.actions = Actions(self.store, config, self.api_base)
 
     def is_at(self, event, d):
-        if event == "GROUP_AT_MESSAGE_CREATE":
+        if event in ("GROUP_AT_MESSAGE_CREATE", "AT_MESSAGE_CREATE"):
             return True
         known = set(
-            self.config.get("bot_mention_ids", {}).get(d.get("group_openid"), [])
+            self.config.get("bot_mention_ids", {}).get(
+                d.get("group_openid") or d.get("channel_id"), []
+            )
         )
-        ids = set(re.findall(r"<@([A-Za-z0-9]+)>", d.get("content") or ""))
+        ids = set(re.findall(r"<@!?([A-Za-z0-9_-]+)>", d.get("content") or ""))
         for item in d.get("mentions") or []:
             if isinstance(item, dict):
                 ids.update(str(item[k]) for k in ("id", "member_openid") if item.get(k))
@@ -84,6 +89,9 @@ class GatewayClient:
             "GROUP_AT_MESSAGE_CREATE",
             "GROUP_MESSAGE_CREATE",
             "C2C_MESSAGE_CREATE",
+            "AT_MESSAGE_CREATE",
+            "MESSAGE_CREATE",
+            "DIRECT_MESSAGE_CREATE",
         ):
             mentions = [
                 {k: m[k] for k in ("id", "member_openid") if m.get(k)}
@@ -96,7 +104,10 @@ class GatewayClient:
                 d.get("group_openid"),
                 json.dumps(mentions),
             )
-            is_at = event == "C2C_MESSAGE_CREATE" or self.is_at(event, d)
+            is_at = (
+                event in ("C2C_MESSAGE_CREATE", "DIRECT_MESSAGE_CREATE")
+                or self.is_at(event, d)
+            ) and not (d.get("author") or {}).get("bot", False)
             new_message, new_wake = await asyncio.to_thread(
                 self.store.save_event, d, is_at, event, frame
             )
@@ -110,7 +121,7 @@ class GatewayClient:
                     or self.config.get("c2c_ack_enabled", False)
                 )
             ):
-                self._spawn(self._send_instant_ack(d))
+                self._spawn(self._send_instant_ack(d, event))
         else:
             await asyncio.to_thread(
                 self.store.record_event, frame or {"t": event, "d": d}
@@ -119,6 +130,12 @@ class GatewayClient:
             await asyncio.to_thread(
                 self.store.record_event, frame or {"t": event, "d": d}
             )
+        if event == "INTERACTION_CREATE" and self.config.get(
+            "interaction_auto_ack", True
+        ):
+            interaction_id = d.get("id") or (frame or {}).get("id")
+            if interaction_id:
+                self._spawn(self._auto_ack_interaction(interaction_id))
         if event in (
             "GROUP_ADD_ROBOT",
             "GROUP_DEL_ROBOT",
@@ -138,7 +155,7 @@ class GatewayClient:
         if item[1] == 0:
             self.message_locks.pop(msg_id, None)
 
-    async def _send_instant_ack(self, d):
+    async def _send_instant_ack(self, d, event="GROUP_MESSAGE_CREATE"):
         msg_id = d["id"]
         item = self._message_lock(msg_id)
         try:
@@ -147,7 +164,12 @@ class GatewayClient:
                 seq = await asyncio.to_thread(self.store.reserve_ack, msg_id)
                 if seq is None:
                     return
-                scope = "group" if d.get("group_openid") else "c2c"
+                scope = {
+                    "C2C_MESSAGE_CREATE": "c2c",
+                    "DIRECT_MESSAGE_CREATE": "dm",
+                    "AT_MESSAGE_CREATE": "channel",
+                    "MESSAGE_CREATE": "channel",
+                }.get(event, "group")
                 if scope == "group":
                     result = await asyncio.to_thread(
                         send_group_message,
@@ -160,7 +182,7 @@ class GatewayClient:
                         msg_id,
                         seq,
                     )
-                else:
+                elif scope == "c2c":
                     from qq_media import api_path
 
                     result = await asyncio.to_thread(
@@ -176,6 +198,20 @@ class GatewayClient:
                             "msg_seq": seq,
                         },
                         20,
+                    )
+                else:
+                    from qq_media import send_guild_message
+
+                    result = await asyncio.to_thread(
+                        send_guild_message,
+                        self.api_base,
+                        token,
+                        scope,
+                        d["guild_id"] if scope == "dm" else d["channel_id"],
+                        {
+                            "content": self.config.get("ack_text", "Received."),
+                            "msg_id": msg_id,
+                        },
                     )
                 if result.get("_http_status") == 401:
                     self.tokens.invalidate()
@@ -220,6 +256,39 @@ class GatewayClient:
                 return result
         finally:
             self._release_message_lock(wake["msg_id"], item)
+
+    async def run_action(self, path, data):
+        token = await self.tokens.get_token()
+
+        async def renew():
+            while True:
+                await asyncio.sleep(20)
+                await asyncio.to_thread(self.actions.renew, data["request_id"])
+
+        lease = asyncio.create_task(renew())
+        try:
+            result = await asyncio.to_thread(self.actions.execute, path, data, token)
+            if result.get("api_result", {}).get("_http_status") == 401:
+                self.tokens.invalidate()
+            return result
+        finally:
+            lease.cancel()
+            await asyncio.gather(lease, return_exceptions=True)
+
+    async def _auto_ack_interaction(self, interaction_id):
+        try:
+            result = await self.run_action(
+                "/interactions/ack",
+                {
+                    "request_id": "auto-ack-"
+                    + hashlib.sha256(interaction_id.encode()).hexdigest(),
+                    "interaction_id": interaction_id,
+                    "code": 0,
+                },
+            )
+            log.info("Interaction receipt ACK status=%s", result["status"])
+        except Exception:
+            log.exception("Interaction receipt ACK failed")
 
     async def _run_once(self):
         token = await self.tokens.get_token()
@@ -361,6 +430,7 @@ class GatewayClient:
         while True:
             try:
                 await asyncio.to_thread(self.store.cleanup)
+                await asyncio.to_thread(self.actions.cleanup)
             except Exception:
                 log.exception("Storage maintenance failed")
             await asyncio.sleep(60)
@@ -435,13 +505,34 @@ class WakeHandler(BaseHTTPRequestHandler):
                 if after < 0 or not 1 <= limit <= 100:
                     raise ValueError("invalid event cursor")
                 self._send(200, {"ok": True, **gw.store.get_events(after, limit)})
+            elif path == "/targets":
+                query = parse_qs(urlsplit(self.path).query)
+                after = int(query.get("after", ["0"])[0])
+                limit = int(query.get("limit", ["100"])[0])
+                if after < 0 or not 1 <= limit <= 100:
+                    raise ValueError("invalid target cursor")
+                self._send(200, {"ok": True, **gw.store.get_targets(after, limit)})
+            elif path.startswith("/operations/"):
+                result = gw.actions.get(
+                    identifier(path.rsplit("/", 1)[1], "request_id")
+                )
+                self._send(
+                    200 if result else 404, {"ok": bool(result), "operation": result}
+                )
+            elif path.startswith("/streams/"):
+                result = gw.actions.get_stream(
+                    identifier(path.rsplit("/", 1)[1], "stream_id")
+                )
+                self._send(
+                    200 if result else 404, {"ok": bool(result), "stream": result}
+                )
             elif path == "/capabilities":
                 self._send(
                     200,
                     {
                         "ok": True,
-                        "schema_version": 1,
-                        "scopes": ["group", "c2c"],
+                        "schema_version": 2,
+                        "scopes": ["group", "c2c", "channel", "dm"],
                         "implemented": [
                             "raw_events",
                             "native_payload",
@@ -450,11 +541,33 @@ class WakeHandler(BaseHTTPRequestHandler):
                             "voice",
                             "file",
                             "chunked_upload",
+                            "proactive_send",
+                            "wakeup",
+                            "event_reply",
+                            "interaction_ack",
+                            "typing",
+                            "recall",
+                            "dm_create",
                         ],
                         "qq_permissions_verified": False,
-                        "streaming": False,
-                        "channels": False,
-                        "proactive": False,
+                        "streaming": True,
+                        "stream_scopes": ["c2c"],
+                        "stream_protocols": ["stream_messages", "legacy"],
+                        "stream_protocol": gw.config.get(
+                            "stream_protocol", "stream_messages"
+                        ),
+                        "channels": True,
+                        "proactive": gw.config.get("proactive_enabled", True),
+                        "interaction_auto_ack": gw.config.get(
+                            "interaction_auto_ack", True
+                        ),
+                        "intents": gw.config.get("intents", 1 << 25),
+                        "media_by_scope": {
+                            "group": ["image", "video", "voice", "file"],
+                            "c2c": ["image", "video", "voice", "file"],
+                            "channel": ["image"],
+                            "dm": ["image"],
+                        },
                         "max_request_bytes": gw.config.get(
                             "max_request_bytes", 24 * 1024 * 1024
                         ),
@@ -480,7 +593,10 @@ class WakeHandler(BaseHTTPRequestHandler):
         if not self._authenticated():
             return
         path = urlsplit(self.path).path.rstrip("/")
-        if path not in ("/wakes/reply", "/media/upload", "/api/request"):
+        if (
+            path not in ("/wakes/reply", "/media/upload", "/api/request")
+            and path not in ACTION_PATHS
+        ):
             self._send(404, {"ok": False, "reason": "not_found"})
             return
         try:
@@ -494,7 +610,10 @@ class WakeHandler(BaseHTTPRequestHandler):
             data = json.loads(self.rfile.read(length).decode("utf-8"))
             if not isinstance(data, dict):
                 raise ValueError()
-            if path == "/api/request":
+            if path in ACTION_PATHS:
+                self.gateway.actions.validate(path, data)
+                wake_id = data.get("wake_id")
+            elif path == "/api/request":
                 method, route = data.get("method"), data.get("path")
                 if (
                     not isinstance(route, str)
@@ -515,9 +634,11 @@ class WakeHandler(BaseHTTPRequestHandler):
                 if type(wake_id) is not int or not 0 < wake_id < 2**63:
                     raise ValueError()
                 if path == "/wakes/reply":
+                    wake = self.gateway.store.get_wake(wake_id)
                     plan = normalize_reply(
                         data,
                         self.gateway.config.get("max_media_bytes", 16 * 1024 * 1024),
+                        wake["scope"] if wake else "group",
                     )
                 else:
                     from qq_media import validate_media
@@ -535,6 +656,8 @@ class WakeHandler(BaseHTTPRequestHandler):
             return
 
         async def execute():
+            if path in ACTION_PATHS:
+                return await gw.run_action(path, data)
             if path == "/wakes/reply":
                 return await gw.reply_to_wake_text(wake_id, plan=plan)
             token = await gw.tokens.get_token()
@@ -587,6 +710,16 @@ class WakeHandler(BaseHTTPRequestHandler):
         try:
             result = future.result(timeout=30)
         except TimeoutError:
+            if path in ACTION_PATHS:
+                self._send(
+                    202,
+                    {
+                        "ok": False,
+                        "status": "processing",
+                        "request_id": data["request_id"],
+                    },
+                )
+                return
             # Upload/API operations have no wake claim; an unknown result must never trigger a blind retry.
             if path != "/wakes/reply":
                 self._send(

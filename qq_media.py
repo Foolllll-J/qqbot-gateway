@@ -3,6 +3,7 @@
 import base64
 import binascii
 import hashlib
+import time
 from urllib.parse import quote, urlsplit
 
 import requests
@@ -20,8 +21,16 @@ PROTECTED_FIELDS = {
 
 
 def api_path(scope, target, suffix="messages"):
-    if scope not in ("group", "c2c") or not isinstance(target, str) or not target:
-        raise ValueError("Only group and c2c targets are supported")
+    if (
+        scope not in ("group", "c2c", "channel", "dm")
+        or not isinstance(target, str)
+        or not target
+    ):
+        raise ValueError("Invalid QQ target")
+    if scope in ("channel", "dm"):
+        if suffix != "messages":
+            raise ValueError("Guild media does not use v2 uploads")
+        return f"/{'channels' if scope == 'channel' else 'dms'}/{quote(target, safe='')}/messages"
     return f"/v2/{'groups' if scope == 'group' else 'users'}/{quote(target, safe='')}/{suffix}"
 
 
@@ -67,7 +76,7 @@ def validate_media(item, max_bytes):
     return content
 
 
-def normalize_reply(data, max_bytes=16 * 1024 * 1024):
+def normalize_reply(data, max_bytes=16 * 1024 * 1024, scope="group"):
     """Build an ordered send plan while preserving unknown QQ body fields."""
     if not isinstance(data, dict):
         raise ValueError("Reply body must be an object")
@@ -98,6 +107,8 @@ def normalize_reply(data, max_bytes=16 * 1024 * 1024):
                 raise ValueError(
                     "QQ association, proactive and stream fields are server-controlled"
                 )
+            if scope in ("channel", "dm") and "msg_type" not in native:
+                native = {**native, "msg_type": 0}
             if type(native.get("msg_type")) is not int or native["msg_type"] < 0:
                 raise ValueError("Native payload requires an integer msg_type")
             plan.append({"payload": native})
@@ -111,6 +122,10 @@ def normalize_reply(data, max_bytes=16 * 1024 * 1024):
         if media:
             for index, source in enumerate(media):
                 validate_media(source, max_bytes)
+                if scope in ("channel", "dm") and source["type"] != "image":
+                    raise ValueError(
+                        "Guild media helper supports images only; use native QQ fields for other bodies"
+                    )
                 plan.append(
                     {
                         "payload": {
@@ -125,6 +140,53 @@ def normalize_reply(data, max_bytes=16 * 1024 * 1024):
     if len(plan) > 5:
         raise ValueError("Send plan exceeds five messages")
     return plan
+
+
+def send_guild_message(
+    base, token, scope, target, payload, source=None, max_bytes=16 * 1024 * 1024
+):
+    """Guild APIs accept URL images or multipart file_image, without v2 msg_type."""
+    import json
+
+    body = dict(payload)
+    body.pop("msg_type", None)
+    body.pop("msg_seq", None)
+    if source is None:
+        return request_json(
+            base, token, "POST", api_path(scope, target), body, timeout=20
+        )
+    if source.get("type") != "image":
+        raise ValueError("Guild media helper supports images only")
+    content = validate_media(source, max_bytes)
+    if content is None:
+        body["image"] = source["url"]
+        return request_json(
+            base, token, "POST", api_path(scope, target), body, timeout=20
+        )
+    fields = {
+        k: json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else str(v)
+        for k, v in body.items()
+        if v is not None
+    }
+    response = requests.post(
+        base + api_path(scope, target),
+        headers={"Authorization": f"QQBot {token}"},
+        data=fields,
+        files={"file_image": (source.get("file_name", "image.bin"), content)},
+        timeout=20,
+        allow_redirects=False,
+    )
+    try:
+        result = response.json()
+    except ValueError:
+        result = {"error": "non_json_response"}
+    if not isinstance(result, dict):
+        result = {"error": "invalid_response_shape"}
+    return {
+        **result,
+        "_http_status": response.status_code,
+        "_trace_id": response.headers.get("x-tps-trace-id"),
+    }
 
 
 class UploadError(RuntimeError):
@@ -145,7 +207,11 @@ def request_json(base, token, method, path, body=None, timeout=60):
         allow_redirects=False,
     )
     try:
-        data = response.json()
+        data = (
+            {}
+            if response.status_code in (202, 204) and not response.content
+            else response.json()
+        )
     except ValueError:
         data = {"error": "non_json_response"}
     if not isinstance(data, dict):
@@ -163,9 +229,19 @@ def upload_media(base, token, scope, target, item, max_bytes=16 * 1024 * 1024):
         body["file_name"] = item["file_name"]
 
     def checked(route, payload):
-        result = request_json(base, token, "POST", route, payload)
+        for attempt in range(5):
+            result = request_json(base, token, "POST", route, payload)
+            # QQ explicitly reports part registration as retryable; no message is sent here.
+            if (
+                route.endswith("/upload_part_finish")
+                and result.get("code", result.get("err_code")) == 40093001
+                and attempt < 4
+            ):
+                time.sleep(min(2**attempt, 4))
+                continue
+            break
         if (
-            result.get("_http_status") != 200
+            not 200 <= result.get("_http_status", 0) < 300
             or result.get("code")
             or result.get("err_code")
             or result.get("error")

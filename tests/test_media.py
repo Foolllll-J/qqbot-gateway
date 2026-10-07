@@ -124,12 +124,14 @@ class MediaTests(unittest.TestCase):
                     ],
                 },
             },
-            {"_http_status": 200},
+            {"_http_status": 400, "code": 40093001},
+            {"_http_status": 204},
             {"_http_status": 200},
             {"_http_status": 200, "file_info": "merged"},
         ]
         with (
             patch.object(media, "request_json", side_effect=responses) as request,
+            patch.object(media.time, "sleep"),
             patch.object(
                 media.requests, "put", return_value=Mock(status_code=200)
             ) as put,
@@ -227,6 +229,7 @@ class MediaTests(unittest.TestCase):
             "db_path": self.store.db_path,
             "context_window": 500,
             "retention_days": 7,
+            "interaction_auto_ack": False,
         }
         gw = server.GatewayClient(cfg)
 
@@ -291,7 +294,8 @@ class MediaTests(unittest.TestCase):
 
         try:
             self.assertEqual(
-                request("GET", "/capabilities")[1]["scopes"], ["group", "c2c"]
+                request("GET", "/capabilities")[1]["scopes"],
+                ["group", "c2c", "channel", "dm"],
             )
             self.assertEqual(
                 request("GET", "/events")[1]["events"][0]["payload"]["d"]["id"], "rich1"

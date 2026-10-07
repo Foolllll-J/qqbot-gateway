@@ -1,0 +1,27 @@
+{
+  "appid": "APPID_HERE",
+  "appsecret": "APPSECRET_HERE",
+  "api_bearer": "GENERATE_RANDOM_BEARER_HERE",
+  "env": "formal",
+  "token_mode": "direct",
+  "http_port": 8082,
+  "db_path": "qqbot_events.db",
+  "intents": 33554432,
+  "bot_mention_ids": {},
+  "ack_enabled": true,
+  "c2c_ack_enabled": false,
+  "ack_text": "Received; your reply is being prepared.",
+  "reply_windows": {
+    "group": 300,
+    "c2c": 300
+  },
+  "context_window": 500,
+  "context_limit": 30,
+  "wake_batch_size": 20,
+  "retention_days": 7,
+  "max_request_bytes": 25165824,
+  "max_media_bytes": 16777216,
+  "max_http_workers": 8,
+  "api_routes": [],
+  "log_level": "INFO"
+}

@@ -1,0 +1,21 @@
+[Unit]
+Description=QQ Official Bot Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=qqbot
+Group=qqbot
+WorkingDirectory=/opt/qqbot-gateway
+ExecStart=/opt/qqbot-gateway/.venv/bin/python /opt/qqbot-gateway/qq_gateway_server.py --config /opt/qqbot-gateway/config.json
+Restart=on-failure
+RestartPreventExitStatus=78
+RestartSec=5
+TimeoutStopSec=90
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

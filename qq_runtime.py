@@ -576,6 +576,9 @@ class EventStore:
         for key in ("attachments", "raw_event"):
             if isinstance(row.get(key), str):
                 row[key] = json.loads(row[key] or "{}")
+        raw = row.get("raw_event")
+        data = raw.get("d") if isinstance(raw, dict) else None
+        row["mentions"] = data.get("mentions") if isinstance(data, dict) else None
         return row
 
     def _record_event(self, conn, frame):

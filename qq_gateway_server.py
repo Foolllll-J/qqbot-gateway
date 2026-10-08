@@ -60,6 +60,12 @@ class GatewayClient:
     def is_at(self, event, d):
         if event in ("GROUP_AT_MESSAGE_CREATE", "AT_MESSAGE_CREATE"):
             return True
+        if event == "GROUP_MESSAGE_CREATE" and "mentions" in d:
+            mentions = d["mentions"]
+            return isinstance(mentions, list) and any(
+                isinstance(item, dict) and item.get("is_you") is True
+                for item in mentions
+            )
         known = set(
             self.config.get("bot_mention_ids", {}).get(
                 d.get("group_openid") or d.get("channel_id"), []

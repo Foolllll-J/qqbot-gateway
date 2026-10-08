@@ -1,8 +1,12 @@
 # 客户端接入约定（schema_version = 2，兼容旧 wakes 接口）
 
-请把客户端改为访问 qqbot-gateway 的 HTTPS HTTP 接口，使用独立 Bearer；不要在客户端保存 QQ AppSecret 或取 QQ token。每 1 分钟轮询 `/wakes`，先检查 `/capabilities`，不要假设所有账号支持所有媒体或模板。
+请把客户端改为访问 qqbot-gateway 的 HTTPS HTTP 接口，使用独立 Bearer；不要在客户端保存 QQ AppSecret 或取 QQ token。每 10 秒轮询 `/wakes`，先检查 `/capabilities`，不要假设所有账号支持所有媒体或模板。
 
-每个 wake 含 id、msg_id、scope（group/c2c/channel/dm）、target_id、content、timestamp、deadline、attachments、raw_event、context。group_openid 保留兼容，其他 scope 为空，不能再以它作为所有会话的标识；以 `(scope,target_id)` 隔离会话。channel 的 target_id 是子频道 channel_id；dm 的 target_id 是私信会话 guild_id，不能用用户 ID 或来源 guild_id 替代。相关原始 ID 在 raw_event.d 中。
+每个 wake 含 id、msg_id、scope（group/c2c/channel/dm）、target_id、content、timestamp、deadline、attachments、mentions、raw_event、context。group_openid 保留兼容，其他 scope 为空，不能再以它作为所有会话的标识；以 `(scope,target_id)` 隔离会话。channel 的 target_id 是子频道 channel_id；dm 的 target_id 是私信会话 guild_id，不能用用户 ID 或来源 guild_id 替代。相关原始 ID 在 raw_event.d 中。
+
+群聊 `GROUP_MESSAGE_CREATE` 优先使用官方 `mentions`：任一条目的 `is_you` 严格为布尔值 true 才进入唤醒队列；字段存在但为空、null、缺少标记或没有 true 时，不使用配置 ID 覆盖。仅字段完全缺失时，以 `bot_mention_ids` 匹配正文 @ ID。专用 `GROUP_AT_MESSAGE_CREATE` 仍直接识别为 @；C2C、频道及频道私信规则不变。不会自动学习身份。
+
+每个 wake 的顶层 `mentions` 原样提取自 `raw_event.d.mentions`；缺失时为 null，原始事件可区分缺失和显式 null。列表和单条 wake 查询都返回该字段。客户端可保留二次核验，但不能因专用 @ 事件或兼容事件缺少 mentions 而一律丢弃 wake。`created_at` 仍为 UTC 入库时间；群聊 300 秒窗口继续从原消息 timestamp 起算，以 deadline 为准；本改动不会清除既有 wake，也不会重算时间窗口。
 
 `attachments` 是原始字段的对象包装，如 `{"attachments":[...],"msg_elements":[...],"embeds":[...]}`；保留字段原名和原值，没有字段时 `{}`。`raw_event` 是完整 dispatch 帧，未知未来字段从 raw_event.d 获取。旧历史行可能为 `{}`。服务端只透传，不做 OCR、语音识别、媒体下载或业务解释。
 

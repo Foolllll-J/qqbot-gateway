@@ -10,7 +10,7 @@ QQ 官方机器人服务端：接收 Gateway 事件、保存原始数据、维�
 
 1. Gateway WS 连接、心跳、会话恢复，以及 AppID/AppSecret 直接获取 token。
 2. 保存收到的原始 dispatch 事件，包括富媒体字段和未知字段。
-3. 将官方 @ 事件、显式配置识别的全量消息 @、C2C 和频道私信消息放入队列。绝不自动学习 mention ID。
+3. 将官方 @ 事件、官方标注或显式配置兜底识别的全量消息 @、C2C 和频道私信消息放入队列。绝不自动学习 mention ID。
 4. 可配置的即时 ack 和 HTTP 收发接口，包括显式主动发送、交互确认和流式协议状态。
 
 稳定目标是协议层尽量不动。QQ 官方 API 变更，或需要增加关键词等新的服务端触发类型时，才调整服务端。回复策略、话术、人设和新群身份映射由客户端或配置处理。新群还必须已加入机器人并具备相应平台权限；仅改配置无法获得权限。新媒体原始字段通过 `raw_event` 直接透传；已有 QQ 消息接口的新 body 字段通过 `qq_payload` 透传。需要不同端点、上传协议或新的状态机时，仍可能需要协议适配，不能保证任意未来功能无需改代码。
@@ -44,7 +44,7 @@ QQ 官方机器人服务端：接收 Gateway 事件、保存原始数据、维�
 
 - `env`: 默认 formal，使用 `https://api.bot.qq.com`。sandbox 沿用历史域名，必须实际验证。
 - `intents`: 默认 `33554432`（群聊/C2C）；频道 @ 为 `1 << 30`、频道私信为 `1 << 12`、按钮回调为 `1 << 26`。全部这些位与默认位合并是 `1174409216`，仅在账号权限允许时配置。全量群/频道消息需要另外的官方权限和 intent，不擅自替你打开。
-- `bot_mention_ids`: `{"真实group_openid": ["该群事件里机器人的真实身份ID"]}`。各群分别配置，不能假设身份跨群相同。官方 GROUP_AT_MESSAGE_CREATE 和 AT_MESSAGE_CREATE 自身已经表明 @ 机器人，无需该映射；全量消息用映射匹配 content 的 @ 或 mentions。频道全量消息的映射键使用 channel_id，同样不自动学习。
+- `bot_mention_ids`: `{"真实group_openid": ["该群事件里机器人的真实身份ID"]}`。各群分别配置，不能假设身份跨群相同。官方 GROUP_AT_MESSAGE_CREATE 和 AT_MESSAGE_CREATE 自身已经表明 @ 机器人，无需该映射；全量群消息优先检查 mentions 中严格为布尔值 true 的 is_you；字段存在而没有 true 时不唤醒（含空列表、null、缺少标记），不会被配置覆盖。仅 mentions 字段完全缺失时用映射匹配 content 的 @。频道全量消息的映射键使用 channel_id，同样不自动学习。
 - `ack_enabled`: 默认 true；`c2c_ack_enabled`: 默认 false。ack 文本由 `ack_text` 配置，ack 失败/超时不自动重发。
 - `proactive_enabled`: 默认 true，允许认证客户端明确请求主动发送；不代表 QQ 账号权限。设为 false 可禁用主动与 wakeup 模式。
 - `interaction_auto_ack`: 默认 true，收到按钮事件后即时回复 code=0 的接收 ACK，不执行客户端业务。若要客户端自行决定 ACK code，设为 false，且客户端必须采用能满足 QQ 约 5 秒时限的事件处理方式；一分钟轮询无法及时确认按钮。
@@ -133,7 +133,7 @@ sudo systemctl status qqbot-gateway
 sudo journalctl -u qqbot-gateway -f
 ```
 
-有旧 gateway/token relay 占用同端口时先停止旧服务；确认客户端切换后再删除旧服务。使用 1Panel/Nginx 提供 HTTPS，反代到 `http://127.0.0.1:8082`，传递 Authorization、允许至少 24 MiB body、超时不少于 45 秒。1Panel 处于容器时须确认能访问宿主机 loopback；不要把无法访问的容器 localhost 当宿主机。8082 无需对公网开放。客户端轮询改为每 1 分钟，服务端不会替你修改客户端定时任务。
+有旧 gateway/token relay 占用同端口时先停止旧服务；确认客户端切换后再删除旧服务。使用 1Panel/Nginx 提供 HTTPS，反代到 `http://127.0.0.1:8082`，传递 Authorization、允许至少 24 MiB body、超时不少于 45 秒。1Panel 处于容器时须确认能访问宿主机 loopback；不要把无法访问的容器 localhost 当宿主机。8082 无需对公网开放。客户端轮询改为每 10 秒，服务端不会替你修改客户端定时任务。
 
 此次提供 Git 项目与 systemd 部署，不含 Docker；后续可以加镜像，但 SQLite 必须持久挂载，仍保持单实例。
 

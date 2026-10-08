@@ -150,7 +150,7 @@ class Tests(unittest.TestCase):
         self.assertTrue(
             gw.is_at(
                 "GROUP_MESSAGE_CREATE",
-                {**self.d, "mentions": [{"member_openid": "BOT"}]},
+                {**self.d, "content": "<@BOT>"},
             )
         )
         self.assertFalse(
@@ -159,6 +159,100 @@ class Tests(unittest.TestCase):
                 {**self.d, "group_openid": "g2", "content": "<@BOT>"},
             )
         )
+
+    def test_official_group_mentions_override_config(self):
+        cfg = {**self.cfg, "bot_mention_ids": {"g": ["OTHER"]}}
+        gw = server.GatewayClient(cfg)
+        cases = [
+            ([{"id": "OTHER", "is_you": False, "bot": False}], False),
+            ([{"id": "BOT", "is_you": True}], True),
+            ([{"is_you": False}, {"is_you": True}], True),
+            ([], False),
+            (None, False),
+            ([{"id": "OTHER"}], False),
+            ([{"is_you": "true"}], False),
+            ([{"is_you": 1}], False),
+            ([None, "invalid", {"is_you": False}], False),
+            ({"is_you": True}, False),
+        ]
+        for mentions, expected in cases:
+            with self.subTest(mentions=mentions):
+                self.assertEqual(
+                    gw.is_at(
+                        "GROUP_MESSAGE_CREATE",
+                        {**self.d, "content": "<@OTHER>", "mentions": mentions},
+                    ),
+                    expected,
+                )
+        self.assertEqual(cfg["bot_mention_ids"], {"g": ["OTHER"]})
+
+    def test_dedicated_at_and_channel_mentions_unchanged(self):
+        gw = server.GatewayClient({**self.cfg, "bot_mention_ids": {"ch": ["BOT"]}})
+        for event in ("GROUP_AT_MESSAGE_CREATE", "AT_MESSAGE_CREATE"):
+            self.assertTrue(gw.is_at(event, {**self.d, "mentions": []}))
+        self.assertTrue(
+            gw.is_at(
+                "MESSAGE_CREATE", {"channel_id": "ch", "mentions": [{"id": "BOT"}]}
+            )
+        )
+
+    def test_dispatch_only_self_mention_creates_wake_and_can_reply(self):
+        cfg = {**self.cfg, "bot_mention_ids": {"g": ["OTHER"]}, "ack_enabled": False}
+        gw = server.GatewayClient(cfg)
+        mentions = [{"id": "BOT", "is_you": True, "extra": {"future": [1, 2]}}]
+        other = {
+            **self.d,
+            "content": "<@OTHER>",
+            "mentions": [{"id": "OTHER", "is_you": False}],
+        }
+        own = {**self.d, "id": "self", "content": "<@BOT>", "mentions": mentions}
+        for data in (other, own):
+            asyncio.run(
+                gw.handle_dispatch(
+                    "GROUP_MESSAGE_CREATE",
+                    data,
+                    {"t": "GROUP_MESSAGE_CREATE", "d": data},
+                )
+            )
+        wakes = gw.store.get_pending_wakes()
+        self.assertEqual(len(wakes), 1)
+        wake = wakes[0]
+        self.assertEqual(wake["msg_id"], "self")
+        self.assertEqual(wake["mentions"], mentions)
+        self.assertEqual(wake["raw_event"]["d"]["mentions"], mentions)
+        detail = gw.store.get_wake(wake["id"])
+        self.assertEqual(detail["mentions"], mentions)
+        self.assertEqual(detail["created_at"], wake["created_at"])
+        expected = datetime.fromisoformat(own["timestamp"]).timestamp() + 300
+        self.assertEqual(wake["deadline"], expected)
+        with patch.object(
+            runtime,
+            "send_group_message",
+            return_value={"_http_status": 200, "id": "sent"},
+        ) as send:
+            result = runtime.reply_to_wake(
+                gw.store, "api", "token", wake["id"], "reply"
+            )
+        self.assertTrue(result["ok"])
+        send.assert_called_once()
+
+    def test_missing_mentions_fallback_and_c2c_unchanged(self):
+        cfg = {**self.cfg, "bot_mention_ids": {"g": ["BOT"]}, "ack_enabled": False}
+        gw = server.GatewayClient(cfg)
+        data = {**self.d, "content": "<@BOT>"}
+        asyncio.run(gw.handle_dispatch("GROUP_MESSAGE_CREATE", data))
+        private = {
+            "id": "private",
+            "author": {"user_openid": "u"},
+            "content": "hello",
+            "timestamp": self.d["timestamp"],
+            "mentions": [],
+        }
+        asyncio.run(gw.handle_dispatch("C2C_MESSAGE_CREATE", private))
+        wakes = gw.store.get_pending_wakes()
+        self.assertEqual([w["scope"] for w in wakes], ["group", "c2c"])
+        self.assertIsNone(wakes[0]["mentions"])
+        self.assertEqual(wakes[1]["mentions"], [])
 
     def test_token_failure_leaves_pending(self):
         gw = server.GatewayClient(self.cfg)
@@ -174,7 +268,8 @@ class Tests(unittest.TestCase):
 
     def test_http_input_and_status(self):
         gw = server.GatewayClient(self.cfg)
-        gw.store.save_event(self.d, True)
+        mentions = [{"id": "BOT", "is_you": True, "extra": {"future": [1, 2]}}]
+        gw.store.save_event({**self.d, "mentions": mentions}, True)
         server.WakeHandler.gateway = gw
         server.WakeHandler.api_bearer = b"a" * 64
         httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.WakeHandler)
@@ -199,8 +294,12 @@ class Tests(unittest.TestCase):
 
         try:
             self.assertEqual(request("GET", "/wakes", auth=False)[0], 401)
-            self.assertEqual(request("GET", "/wakes?unused=1")[0], 200)
-            self.assertEqual(request("GET", "/wakes/1")[1]["wake"]["status"], "pending")
+            status, body = request("GET", "/wakes?unused=1")
+            self.assertEqual(status, 200)
+            self.assertEqual(body["wakes"][0]["mentions"], mentions)
+            detail = request("GET", "/wakes/1")[1]["wake"]
+            self.assertEqual(detail["status"], "pending")
+            self.assertEqual(detail["mentions"], mentions)
             for body in (
                 "[]",
                 '{"wake_id":1,"text":42}',
